@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 
 import openai
 import taskbridge
@@ -54,6 +55,10 @@ CUT_KEEP = 1000  # characters a tool result keeps once the context is full
 # times in a row an empty or cut-off reply gets a "continue" before the run
 # stops
 MAX_NUDGES = 3
+# deliverable-missing nudges before the run stops honestly (§1)
+MAX_GATE_NUDGES = 5
+# consecutive identical tool-error replies before the run stops honestly (§2)
+MAX_ERR_RETRIES = 3
 # lower it for a small context window
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "32000"))
 # Claude caches a prompt prefix only when marked with cache_control. Each call
@@ -275,6 +280,223 @@ async def shorten(session, messages):
   return True
 
 
+# --- Deliverable gate (§1), tool-error (§2) and fabrication (§3) guards ---
+#
+# The 2026-11-24 Codespace evals all scored 0.0 because the loop trusted the
+# model's words: a text reply claiming completion was accepted although no
+# deliverable existed on disk. These helpers make solve() check the disk
+# itself before accepting any reply as final.
+
+DELIVERABLE_PATH_RE = re.compile(r"`([^`\n]{1,120})`")
+PATH_LIKE_EXTS = (
+    ".zip", ".txt", ".md", ".docx", ".pdf", ".py", ".xlsx", ".csv", ".json",
+    ".html", ".tex",
+)
+# The probe script stays small even for instructions naming many files.
+MAX_GATE_CANDIDATES = 60
+
+
+def deliverable_candidates(instruction):
+  """Paths the instruction names as deliverables, plus the output/ convention.
+
+  Returns (file_paths, dir_paths): paths relative to the workdir unless
+  absolute. A backticked span ending in "/" is a directory that must contain
+  files; a span containing "/" or ending in a known extension is a file.
+  """
+  files, dirs = ["output/submission.zip"], ["output"]
+  seen_f, seen_d = set(files), set(dirs)
+  for match in DELIVERABLE_PATH_RE.finditer(instruction or ""):
+    token = match.group(1).strip()
+    if not token:
+      continue
+    if token.endswith("/"):
+      key = token.rstrip("/")
+      if key and key not in seen_d:
+        seen_d.add(key)
+        dirs.append(key)
+    elif "/" in token or token.lower().endswith(PATH_LIKE_EXTS):
+      if token not in seen_f:
+        seen_f.add(token)
+        files.append(token)
+  return files[:MAX_GATE_CANDIDATES], dirs[:10]
+
+
+TOOL_ERROR_RE = re.compile(
+    r"^\s*error[: ]|empty parameters|must include a valid json object"
+    r"|did you paste the request incorrectly",
+    re.I,
+)
+FABRICATED_MARKERS = (
+    "bash(", "read_file(", "write_file(", '{"functionname"',
+    '"function_name"', "<tool_call>", "function_calls", "tool result:",
+)
+
+
+def looks_like_tool_error(text):
+  """Whether a text-only reply is a tool error echoed as text, not a summary."""
+  return bool(text and TOOL_ERROR_RE.search(text))
+
+
+def looks_fabricated(text, used_tool):
+  """Whether a no-tool reply fakes a tool-call transcript in plain text.
+
+  Only applies before the model has used any real tool: once it genuinely
+  used tools, a summary describing past work is normal and the deliverable
+  gate is the check that applies.
+  """
+  if used_tool or not text:
+    return False
+  low = text.lower()
+  hits = sum(1 for marker in FABRICATED_MARKERS if marker in low)
+  claims_file = bool(
+      re.search(
+          r"\b(wrote|created|saved|written)\b.{0,60}\.(zip|txt|md|docx|pdf|py|xlsx)",
+          low,
+      )
+  )
+  return hits >= 2 or (hits >= 1 and claims_file)
+
+
+def _gate_probe_script(files, dirs):
+  """One read-only bash probe: one `F <i> ...` / `D <j> ...` line per candidate.
+
+  Files print existence, size and mtime; directories print file count and a
+  hash of their file listing. Paths are shell-quoted; the probe writes nothing.
+  """
+  lines = []
+  for i, path in enumerate(files):
+    quoted = shlex.quote(path)
+    lines.append(
+        f'if [ -f {quoted} ]; then echo "F {i} 1 $(stat -c %s {quoted})'
+        f' $(stat -c %Y {quoted})"; else echo "F {i} 0 - -"; fi'
+    )
+  for j, path in enumerate(dirs):
+    quoted = shlex.quote(path)
+    lines.append(
+        f'if [ -d {quoted} ]; then echo "D {j} $(find {quoted} -type f'
+        f' 2>/dev/null | wc -l) $(find {quoted} -type f -printf \'%p %s'
+        f' %T@\\n\' 2>/dev/null | sort | md5sum | cut -d\' \' -f1)";'
+        f' else echo "D {j} - -"; fi'
+    )
+  return "\n".join(lines)
+
+
+def _parse_gate_output(output):
+  """Parses probe output into ({file_i: (size, mtime) | None}, {dir_j: ...}).
+
+  Returns None when the output carries no usable probe line.
+  """
+  files, dirs = {}, {}
+  for line in (output or "").splitlines():
+    parts = line.split()
+    if len(parts) == 5 and parts[0] == "F" and parts[1].isdigit():
+      files[int(parts[1])] = (
+          None if parts[2] == "0" else (parts[3], parts[4])
+      )
+    elif len(parts) == 4 and parts[0] == "D" and parts[1].isdigit():
+      dirs[int(parts[1])] = None if parts[2] == "-" else (parts[2], parts[3])
+  if not files and not dirs:
+    return None
+  return files, dirs
+
+
+async def _gate_baseline(session, files, dirs):
+  """One probe at the start of solve(); None when it fails (gate fails open)."""
+  try:
+    result = await session.exec(
+        _gate_probe_script(files, dirs), timeout_sec=30
+    )
+    snapshot = _parse_gate_output(result.get("output", ""))
+  except taskbridge.TaskError as exc:
+    await session.log(
+        "deliverable baseline probe failed"
+        f" ({str(exc)[:200]}); gate will fail open"
+    )
+    return None
+  if snapshot is None:
+    await session.log(
+        "deliverable baseline probe returned nothing usable;"
+        " gate will fail open"
+    )
+    return None
+  return snapshot
+
+
+async def deliverable_gate(session, files, dirs, baseline):
+  """Tri-state disk check: ("ok" | "missing" | "unknown", detail).
+
+  A path counts as delivered only when it is new or changed since the
+  baseline snapshot, so pre-existing input files never count. "unknown"
+  fails open: a hidden task whose deliverable layout the gate cannot parse
+  must not be blocked by the gate.
+  """
+  if baseline is None:
+    return "unknown", "the deliverable check could not run"
+  try:
+    result = await session.exec(
+        _gate_probe_script(files, dirs), timeout_sec=30
+    )
+    snapshot = _parse_gate_output(result.get("output", ""))
+  except taskbridge.TaskError as exc:
+    await session.log(
+        f"deliverable gate probe failed ({str(exc)[:200]}); failing open"
+    )
+    return "unknown", "the deliverable check could not run"
+  if snapshot is None:
+    await session.log(
+        "deliverable gate probe returned nothing usable; failing open"
+    )
+    return "unknown", "the deliverable check could not run"
+  now_files, now_dirs = snapshot
+  base_files, base_dirs = baseline
+  delivered = []
+  for i, path in enumerate(files):
+    now = now_files.get(i)
+    if now is not None and base_files.get(i) != now:
+      delivered.append(f"`{path}`")
+  for j, path in enumerate(dirs):
+    now = now_dirs.get(j)
+    if now is not None and now[0] != "0" and base_dirs.get(j) != now:
+      delivered.append(f"`{path}/`")
+  if delivered:
+    return "ok", "found " + ", ".join(delivered[:3])
+  missing = []
+  for i, path in enumerate(files):
+    now = now_files.get(i)
+    if now is None:
+      missing.append(f"`{path}` does not exist")
+    elif base_files.get(i) == now:
+      missing.append(f"`{path}` is unchanged since the start")
+    if len(missing) >= 2:
+      break
+  for j, path in enumerate(dirs):
+    now = now_dirs.get(j)
+    if now is None:
+      missing.append(f"`{path}/` does not exist")
+    elif now[0] == "0":
+      missing.append(f"`{path}/` is empty")
+    elif base_dirs.get(j) == now:
+      missing.append(f"`{path}/` is unchanged since the start")
+    if len(missing) >= 3:
+      break
+  return "missing", "; ".join(missing) or "no deliverable found"
+
+
+def _gate_nudge_text(detail, nudge_number, remaining):
+  """Escalating nudge after a summary claims completion with no deliverable."""
+  if nudge_number >= 3:
+    return (
+        f"Still no deliverable on disk ({detail}). Write a first COMPLETE"
+        " version now, even if imperfect — a file on disk is what gets"
+        f" graded. You have {remaining} more tries before I stop."
+    )
+  return (
+      "Your summary says the work is done, but I checked the container and"
+      f" the deliverable is not on disk yet: {detail}. Continue working with"
+      " the tools — write the deliverable first, then give your summary."
+  )
+
+
 async def solve(session):
   """Runs the minimal tool-calling loop on `session` until completion.
 
@@ -288,8 +510,13 @@ async def solve(session):
       {"role": "system", "content": SYSTEM.format(workdir=session.workdir)},
       {"role": "user", "content": session.instruction},
   ]
+  # The deliverable gate (§1): snapshot the container before the model does
+  # any work, so pre-existing input files never count as deliverables.
+  files, dirs = deliverable_candidates(session.instruction)
+  baseline = await _gate_baseline(session, files, dirs)
   # head: the start of an answer cut off at the output limit
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
+  gate_nudges, err_streak, last_err = 0, 0, ""
   while True:
     left = session.time_left()  # None when the task has no time limit
     wrap_up = left is not None and left < WRAP_UP_SEC
@@ -327,16 +554,107 @@ async def solve(session):
         reply.choices[0].finish_reason == "length",
     )
     text = head + (message.content or "")
-    if text:
-      # what taskbridge sends if the time runs out first
-      session.final_message = text
     # Send the message back as the endpoint returned it: Gemini refuses a tool
     # call that comes back without its thought signature, which is one of the
     # endpoint's own fields.
     turn = message.model_dump(exclude_none=True)
     if wrap_up or not message.tool_calls:
       used_tool = any(m.get("role") == "tool" for m in messages)
+      if not message.tool_calls and message.content and not wrap_up:
+        if looks_like_tool_error(text):
+          # §2: an error echoed as text is not a summary; retry the call.
+          err = text.strip()[:200]
+          err_streak = err_streak + 1 if err == last_err else 1
+          last_err = err
+          if err_streak >= MAX_ERR_RETRIES or nudges >= MAX_NUDGES:
+            gate, detail = await deliverable_gate(
+                session, files, dirs, baseline
+            )
+            if gate == "ok":
+              session.final_message = (
+                  "The run ended with a deliverable on disk, but the"
+                  " model's last reply was a tool error, not a summary"
+                  f" ({err})."
+              )
+            elif gate == "unknown":
+              session.final_message = (
+                  "The run ended after repeated tool errors; the"
+                  " deliverable check could not run, so nothing was"
+                  f" verified ({err})."
+              )
+            else:
+              session.final_message = (
+                  "The run ended without a deliverable on disk: the model"
+                  " kept returning a tool error instead of calling a tool"
+                  f" ({err})."
+              )
+            return session.final_message
+          messages.append(turn)
+          messages.append({
+              "role": "user",
+              "content": (
+                  "That was an error message, not a summary. The tool call"
+                  f" failed: {err}. Send the call again with a valid JSON"
+                  " object for the arguments. If the same call keeps"
+                  " failing, simplify it — first run a trivial command such"
+                  " as bash `echo ok` to confirm the loop works, then retry"
+                  " the real call."
+              ),
+          })
+          nudges, head = nudges + 1, text
+          continue
+        if looks_fabricated(text, used_tool):
+          # §3: a fake tool-call transcript in text; sharp nudge. Counts
+          # under the MAX_NUDGES budget, so a model that keeps fabricating
+          # falls through to the accept decision, where the gate blocks it.
+          if nudges < MAX_NUDGES:
+            messages.append(turn)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your reply shows tool calls as text. Text does nothing"
+                    " — only real tool calls run anything. Call the tools"
+                    " now: start with bash `ls` to see the workspace, then"
+                    " do each step with a real tool call and check the tool"
+                    " result before claiming anything."
+                ),
+            })
+            nudges, head = nudges + 1, text
+            continue
       if wrap_up or ((message.content and not cut) and (used_tool or nudges == MAX_NUDGES)):
+        # §1: never accept a plain-text reply as done until the deliverable
+        # is on disk. §4: only an accepted reply becomes the final message,
+        # so a hallucinated summary can never be what taskbridge sends.
+        gate, detail = await deliverable_gate(session, files, dirs, baseline)
+        if gate == "missing":
+          if wrap_up or gate_nudges >= MAX_GATE_NUDGES:
+            session.final_message = (
+                "The run ended without a deliverable on disk. " + detail
+            )
+            return session.final_message
+          gate_nudges += 1
+          if message.content:
+            messages.append(turn)
+          messages.append({
+              "role": "user",
+              "content": _gate_nudge_text(
+                  detail, gate_nudges, MAX_GATE_NUDGES - gate_nudges
+              ),
+          })
+          # NOTE: nudges is deliberately not incremented here. The accept
+          # condition tests `nudges == MAX_NUDGES`; incrementing past it
+          # would strand the run on generic nudges until the time limit.
+          continue
+        if looks_like_tool_error(text):
+          # Never accept an error as the final summary, even when a
+          # deliverable exists (§2).
+          session.final_message = (
+              "The run ended with a deliverable on disk, but the model's"
+              " last reply was a tool error, not a summary"
+              f" ({text.strip()[:200]})."
+          )
+          return session.final_message
+        session.final_message = text
         return session.final_message
       nudges, head = nudges + 1, text
       if message.content:  # cut off at the output limit
