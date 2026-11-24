@@ -1,47 +1,38 @@
-# minimal: a short tool-calling loop on Gemini 3.8 Flash
+# PLE Agent Harness — Google Physical-Engineering's Last Exam
 
-The smallest complete harness in this repository (under 250 lines of code in
-`serve.py`, built on `taskbridge.py`) and the easiest starting point for a
-custom agent. It calls the Google-sponsored `google-cloud/gemini-3.8-flash`
-model, so it needs no API key.
+Kaggle competition: [Physical-Engineering's Last Exam](https://www.kaggle.com/competitions/physical-engineerings-last-exam)
+($400,000 prize pool; deadline 5 Jan 2027 23:59 UTC).
 
-## How it works
+## Layout
 
-`solve(session)` in `serve.py` implements the entire agent loop:
+- `kit/` — official PLE kit (`google-research/ple`, Apache 2.0): evaluation harness,
+  dev-set tooling, and `sample_submissions/`.
+- `serve.py` / `taskbridge.py` — our agent harness (WebSocket server speaking the
+  kit's JSON protocol).
+- `submission.yaml` — submission manifest (validated with `uv run python -m kit check`).
+- `requirements.txt` — harness dependencies.
 
-1. Sends a concise system prompt, the task instruction, and three tools (`bash`, `read_file`, and `write_file`).
-2. Executes each tool call inside the task container via `session.exec`,
-   `session.read_file`, or `session.write_file`, and returns the output to the
-   model along with the remaining task time in minutes.
-3. When the model responds without calling a tool, that response becomes
-   `final_message`. If a response is empty or truncated at the token limit, the
-   loop nudges the model to continue (up to `MAX_NUDGES = 3` times) and
-   concatenates truncated replies.
-4. Four minutes before the task deadline (`WRAP_UP_SEC`), any in-flight model call is cancelled and the model is asked for its final summary with `tool_choice="none"`.
-5. Transient API failures (`429`, `5xx`, or dropped connections) are logged and retried with backoff (`RETRY_WAITS`, 5 seconds to 2 minutes, stopping before the wrap-up deadline) without polluting the conversation history. If the endpoint returns a `400` context-length error, the older half of long tool outputs is trimmed to the first 1,000 characters (`CUT_KEEP`) and the call is retried.
+## Development
 
-Every non-empty text response updates `session.final_message` so `taskbridge`
-still sends the latest summary if the task is cancelled. Token usage is reported
-after each call via `session.usage`. Assistant messages are appended via
-`model_dump()` so provider-specific fields (like Gemini's thought signatures)
-are preserved across turns.
+This repo is developed inside a GitHub Codespace (4-core/16 GB) with
+Docker-in-Docker (see `.devcontainer/devcontainer.json`), because the kit's
+build step needs a real Docker daemon.
 
-| File | Purpose |
-|---|---|
-| `serve.py` | Agent loop and tool definitions |
-| `taskbridge.py` | Serve protocol implementation (shared across Python samples) |
-| `requirements.txt` | Pinned `openai` and `websockets` dependencies |
-| `submission.yaml` | Model declaration, build command, and server startup command |
+```bash
+# inside the codespace
+uv run python -m kit check
+```
 
-## Customizing
+## Status
 
-Because the OpenAI SDK reads `OPENAI_BASE_URL` and `OPENAI_API_KEY` (which the evaluator sets for every model), you can switch to any model in [`docs/models.md`](../../docs/models.md) just by changing `model_api` in `submission.yaml`.
+- **Phase 0 (done, 23 Nov 2026):** kit + dev dataset downloaded locally; `kit check`
+  passes submission.yaml/files, build blocked (no Docker in the local VM).
+- **Phase 1 (in progress):** harness v0 on Codespaces — verify Docker-in-Docker,
+  pass `kit check` build, run 2–3 dev tasks end-to-end.
 
-- For models with smaller context windows, set a lower `MAX_OUTPUT_TOKENS` (default `32000`) under `env:` in `submission.yaml`.
-- To try it locally without a Google Cloud project for `kit/model_proxy`, set
-  `model_api: gemini/gemini-3.8-flash` and put `GEMINI_API_KEY` in your
-  environment or `--env-file`. That entry runs locally only; submit it with a
-  `google-cloud/<id>` model.
-- Always generate your `artifacts/` with the same `model_api` you submit.
+## Notes
 
-To keep the code minimal, this starter omits task MCP tools (so `kit check` prints a warning at the `mcp` stage), streaming, and compaction into notes (it only cuts old tool results once the context is full). See [`custom-openai`](../custom-openai/) for a full harness with those features, or [`plan-verify`](../plan-verify/) for a multi-role planner/worker/verifier loop built on `minimal`.
+- The dev dataset (gated Hugging Face `google/physical-engineerings-last-exam`)
+  is **not** committed here; download it inside the codespace when needed.
+- No API keys or credentials are stored in this repo. The dev model is supplied
+  separately at runtime (free-tier key), never committed.
