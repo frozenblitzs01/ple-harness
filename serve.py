@@ -69,11 +69,7 @@ CACHE_MARK = "claude" in MODEL.lower()
 # idle limit.
 client = openai.AsyncOpenAI(max_retries=5, timeout=1800)
 
-SYSTEM = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools \
-act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with \
-code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check \
-it. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key \
-results."""
+SYSTEM = 'You are an expert engineer working on a task in a Linux container with no internet access. Your tools act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check it. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key results. Do every action by calling the provided function tools, never by writing a tool call as text or JSON in your reply, and never claim a file or change exists until a tool result confirms it.'
 
 
 def tool(name, description, **params):
@@ -339,7 +335,8 @@ async def solve(session):
     # endpoint's own fields.
     turn = message.model_dump(exclude_none=True)
     if wrap_up or not message.tool_calls:
-      if wrap_up or (message.content and not cut) or nudges == MAX_NUDGES:
+      used_tool = any(m.get("role") == "tool" for m in messages)
+      if wrap_up or ((message.content and not cut) and (used_tool or nudges == MAX_NUDGES)):
         return session.final_message
       nudges, head = nudges + 1, text
       if message.content:  # cut off at the output limit
@@ -349,7 +346,7 @@ async def solve(session):
           "content": (
               "Your reply was cut off; continue where it stopped."
               if cut
-              else "Continue the task, and finish with your summary."
+              else ("You have not called any tool yet. Use a tool to do the work and check the result before giving your final summary." if not used_tool else "Continue the task, and finish with your summary.")
           ),
       })
       continue
