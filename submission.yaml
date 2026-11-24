@@ -3,7 +3,7 @@
 # against a local OpenAI-compatible model server.
 # For the real submission this MUST go back to a google-cloud/<id> model.
 name: frozen008-harness
-model_api: openai-compatible/qwen-flash-character
+model_api: openai-compatible/qwen-plus-character
 model_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 install: >-
   uv venv --python 3.12 /opt/harness/venv
