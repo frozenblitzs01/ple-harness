@@ -1,302 +1,471 @@
-"""Stub verification for the serve.py agent-loop fix (design 2026-11-24, section 6).
-No network, no API key, no Codespace services: drives serve.solve() with
-scripted model replies and an in-memory fake container (dict filesystem).
-Run: python3 serve-loop-fix-test.py
+"""Local verification for the serve.py deliverable gate (no model, no network).
+
+Drives serve.solve() with scripted model replies and a FakeSession backed by
+a real temp directory (so the gate's bash probe runs for real), plus direct
+unit tests of deliverable_candidates() / deliverable_gate().
+
+Run: /tmp/ple-test-venv/bin/python serve-loop-fix-test.py
+Exit 0 = all scenarios pass.
 """
+
 import asyncio
-import json
 import os
+import subprocess
 import sys
+import tempfile
 
-os.environ.setdefault("MODEL_NAME", "qwen-flash-character")
-os.environ.setdefault("OPENAI_API_KEY", "test-dummy")
+os.environ.setdefault("MODEL_NAME", "openai-compatible/qwen-flash-character")
+os.environ.setdefault("OPENAI_API_KEY", "test")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HARNESS_DIR)
 
-try:
-    import openai  # noqa: F401
-except ImportError:
-    import types as _types
-    _fake_openai = _types.ModuleType("openai")
-    class _APIError(Exception):
-        pass
-    class _AsyncOpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-    _fake_openai.AsyncOpenAI = _AsyncOpenAI
-    _fake_openai.APIError = _APIError
-    sys.modules["openai"] = _fake_openai
+import serve  # noqa: E402
+import taskbridge  # noqa: E402
 
-import serve
+SMOKE = (
+    "Create a file named `hello.txt` in the current working directory (`/app`)"
+    " whose entire content is the single line:\n\nHELLO\n\nDo not create any"
+    " other files. When the file exists, reply with the word done and stop."
+)
 
+EVAL1_ERROR = (
+    "Error: Empty parameters received; each tool call must include a valid"
+    " JSON object with keys functionName, properties, and optional"
+    " returnType. Did you paste the request incorrectly?"
+)
 
-class FakeSession:
-    def __init__(self, instruction, workdir="/app/files", time_left=21600, fail_probe=False):
-        self.instruction = instruction
-        self.workdir = workdir
-        self.final_message = None
-        self._time_left = time_left
-        self._fail_probe = fail_probe
-        self.fs = {}
-        self.mtime = {}
-        self._clock = 1000
-        self.logs = []
-        self.usage_calls = []
+FABRICATED = (
+    "Done. I ran the analysis:\n"
+    "bash(ls -la output/)\n"
+    "Tool result: total 0\n"
+    "bash(python3 build.py)\n"
+    "RESULT: exit code 0\n"
+    "I wrote output/submission.zip and verified it. Summary: all checks pass."
+)
 
-    def time_left(self):
-        return self._time_left
-
-    async def log(self, text):
-        self.logs.append(text)
-
-    async def usage(self, *args):
-        self.usage_calls.append(args)
-
-    def _key(self, path):
-        if path.startswith("/"):
-            return path
-        return self.workdir.rstrip("/") + "/" + path
-
-    async def exec(self, cmd, timeout_sec=None):
-        if self._fail_probe and "GATE_FILE" in cmd:
-            raise RuntimeError("probe boom")
-        out = []
-        if "GATE_FILE" in cmd or "GATE_DIR" in cmd:
-            import re as _re
-            for line in cmd.splitlines():
-                m = _re.search(r"GATE_FILE (\d+)", line)
-                if m:
-                    pm = _re.search(r"\[ -f '?([^'\s\]]+)'?", line)
-                    p = pm.group(1) if pm else ""
-                    key = p if p in self.fs else self._key(p)
-                    if key in self.fs:
-                        out.append(f"GATE_FILE {m.group(1)} OK {len(self.fs[key])} {self.mtime[key]}")
-                    else:
-                        out.append(f"GATE_FILE {m.group(1)} NO")
-                    continue
-                m = _re.search(r"GATE_DIR (\d+)", line)
-                if m:
-                    pm = _re.search(r"\[ -d '?([^'\s\]]+)'?", line)
-                    p = pm.group(1) if pm else ""
-                    prefix = p if p.startswith("/") else self.workdir.rstrip("/") + "/" + p
-                    files = sorted(k for k in self.fs if k == prefix or k.startswith(prefix.rstrip("/") + "/"))
-                    if files:
-                        out.append(f"GATE_DIR {m.group(1)} OK")
-                        for k in files:
-                            out.append(f"{k}|{len(self.fs[k])}|{self.mtime[k]}")
-                        out.append(f"GATE_DIR_END {m.group(1)}")
-                    else:
-                        out.append(f"GATE_DIR {m.group(1)} NO")
-                    continue
-            return {"exit_code": 0, "output": "\n".join(out) + "\n", "truncated": False, "timed_out": False}
-        stripped = cmd.strip()
-        if stripped == "echo ok":
-            return {"exit_code": 0, "output": "ok\n", "truncated": False, "timed_out": False}
-        if stripped == "ls":
-            return {"exit_code": 0, "output": "\n".join(sorted(self.fs)) + "\n", "truncated": False, "timed_out": False}
-        if stripped.startswith("cat "):
-            key = self._key(stripped[4:].strip())
-            return {"exit_code": 0, "output": self.fs.get(key, ""), "truncated": False, "timed_out": False}
-        return {"exit_code": 0, "output": "", "truncated": False, "timed_out": False}
-
-    async def read_file(self, path):
-        return self.fs.get(self._key(path), "")
-
-    async def write_file(self, path, content):
-        key = self._key(path)
-        self._clock += 1
-        self.fs[key] = content if isinstance(content, str) else content.decode()
-        self.mtime[key] = self._clock
-        return f"Wrote {len(self.fs[key])} bytes to {path}"
+HALLUCINATED = (
+    "Done. I created validation_memo.docx, error_calculation.txt and"
+    " rework_recommendations.md in output/. The fire test ran 48 minutes,"
+    " the simulation 46 minutes, error -4%. No rework needed."
+)
 
 
-class FakeMsg:
-    def __init__(self, content=None, tool_calls=None, finish_reason="stop"):
-        self.content = content
-        self.tool_calls = tool_calls
-        self.finish_reason = finish_reason
+# ---------------------------------------------------------------- fakes
 
-    def model_dump(self, exclude_none=False):
-        d = {"role": "assistant", "content": self.content}
-        if self.tool_calls is not None:
-            d["tool_calls"] = self.tool_calls
-        if exclude_none and self.content is None:
-            d.pop("content", None)
-        return d
+class FakeMessage:
+  def __init__(self, content=None, tool_calls=None, finish_reason="stop"):
+    self.content = content
+    self.tool_calls = tool_calls or []
+    self.finish_reason = finish_reason
 
-
-def tool_call(call_id, name, args):
-    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+  def model_dump(self, exclude_none=True):
+    out = {"role": "assistant", "content": self.content}
+    if self.tool_calls:
+      out["tool_calls"] = self.tool_calls
+    return out
 
 
-class FakeResp:
-    def __init__(self, msg):
-        self.choices = [type("Choice", (), {"message": msg, "finish_reason": msg.finish_reason})()]
-        self.usage = None
+class FakeChoice:
+  def __init__(self, message):
+    self.message = message
+    self.finish_reason = message.finish_reason
+
+
+class FakeReply:
+  def __init__(self, message):
+    self.choices = [FakeChoice(message)]
+    self.usage = None
+
+
+class FakeCompletions:
+  def __init__(self, outer):
+    self.outer = outer
+
+  async def create(self, **kwargs):
+    self.outer.calls += 1
+    if not self.outer.replies:
+      raise AssertionError("model called with no scripted reply left")
+    reply = self.outer.replies.pop(0)
+    if reply == "RAISE_TIMEOUT":
+      raise asyncio.TimeoutError
+    return reply
+
+
+class FakeChat:
+  def __init__(self, outer):
+    self.completions = FakeCompletions(outer)
 
 
 class FakeClient:
-    def __init__(self, replies):
-        self.replies = list(replies)
-        self.calls = 0
-        self.last_messages = None
-        self.chat = self
-        self.completions = self
-
-    async def create(self, **kwargs):
-        self.calls += 1
-        self.last_messages = kwargs.get("messages")
-        idx = min(self.calls - 1, len(self.replies) - 1)
-        return FakeResp(self.replies[idx])
+  def __init__(self, replies):
+    self.replies = list(replies)
+    self.calls = 0
+    self.chat = FakeChat(self)
 
 
-def text_reply(text):
-    return FakeMsg(content=text, tool_calls=None)
+def tool_call(name, args, call_id="call-1"):
+  return {
+      "id": call_id,
+      "type": "function",
+      "function": {"name": name, "arguments": args},
+  }
 
 
-def run_scenario(coro):
-    return asyncio.run(coro)
+class FakeSession:
+  """taskbridge.Session surface backed by a real temp directory."""
+
+  def __init__(self, instruction, time_left_value=6 * 3600, fail_probe=False):
+    self._tmp = tempfile.TemporaryDirectory()
+    self.root = self._tmp.name
+    self.workdir = self.root
+    self.instruction = instruction
+    self.final_message = ""
+    self._time_left = time_left_value
+    self._fail_probe = fail_probe
+    self.logs = []
+
+  def time_left(self):
+    return self._time_left
+
+  async def log(self, text):
+    self.logs.append(text)
+
+  async def usage(self, *args):
+    pass
+
+  def _resolve(self, path):
+    if os.path.isabs(path):
+      return path
+    return os.path.join(self.root, path)
+
+  async def exec(self, command, timeout_sec=120):
+    if self._fail_probe and 'echo "F ' in command:
+      raise taskbridge.TaskError("probe exec failed (test)")
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=self.root,
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+    )
+    return {
+        "exit_code": result.returncode,
+        "output": result.stdout + result.stderr,
+        "truncated": False,
+        "timed_out": False,
+    }
+
+  async def read_file(self, path):
+    with open(self._resolve(path), "rb") as fh:
+      return fh.read()
+
+  async def write_file(self, path, content):
+    full = self._resolve(path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    data = content.encode("utf-8")
+    with open(full, "wb") as fh:
+      fh.write(data)
+    return len(data)
 
 
-ERROR_TEXT = ("Error: Empty parameters received; each tool call must include a valid "
-              "JSON object with keys functionName, properties, and optional returnType. "
-              "Did you paste the request incorrectly?")
+def run_solve(session, replies):
+  client = FakeClient(replies)
+  serve.client = client
+  result = asyncio.run(serve.solve(session))
+  return result, client
 
 
-def scenario_1():
-    instruction = "Design the roof deck. Write your answer to `output/submission.zip`."
-    summary = "Done. Deliverable: output/submission.zip with the roof deck design."
-    replies = [
-        text_reply("Done. The roof deck design is complete."),
-        FakeMsg(content="", tool_calls=[tool_call("c1", "write_file", {"path": "output/submission.zip", "content": "ZIPDATA"})]),
-        text_reply(summary),
-    ]
-    client = FakeClient(replies)
-    serve.client = client
-    session = FakeSession(instruction)
-    result = run_scenario(serve.solve(session))
-    assert result == summary, result
-    assert session.final_message == summary
-    assert "/app/files/output/submission.zip" in session.fs, session.fs
-    assert client.calls == 3, client.calls
-    print("scenario 1 (text-only done, no deliverable -> gated, then delivered): PASS")
+def check(name, condition, detail=""):
+  if not condition:
+    raise AssertionError(f"FAIL {name}: {detail}")
+  print(f"PASS {name}")
 
 
-def scenario_2():
-    instruction = "Design the roof deck. Write your answer to `output/submission.zip`."
-    summary = "Done. Deliverable: output/submission.zip."
-    replies = [
-        text_reply(ERROR_TEXT),
-        FakeMsg(content="", tool_calls=[tool_call("c1", "bash", {"command": "echo ok"})]),
-        FakeMsg(content="", tool_calls=[tool_call("c2", "write_file", {"path": "output/submission.zip", "content": "ZIPDATA"})]),
-        text_reply(summary),
-    ]
-    client = FakeClient(replies)
-    serve.client = client
-    session = FakeSession(instruction)
-    result = run_scenario(serve.solve(session))
-    assert result == summary, result
-    assert session.final_message == summary
-    assert ERROR_TEXT not in (session.final_message or "")
-    assert "/app/files/output/submission.zip" in session.fs
-    print("scenario 2 (malformed tool call -> retried, not fatal): PASS")
+# ---------------------------------------------------------------- scenarios
+
+def scenario_1_text_only_done_then_real_work():
+  """Text-only 'done' with no deliverable is nudged, not accepted."""
+  session = FakeSession(
+      "Design the roof deck. Write the deliverable to"
+      " `output/submission.zip`."
+  )
+  replies = [
+      FakeReply(FakeMessage(
+          "Done. The roof deck design is complete and saved to"
+          " output/submission.zip.")),
+      FakeReply(FakeMessage(tool_calls=[
+          tool_call("write_file",
+                    '{"path": "output/submission.zip", "content": "PK fake zip"}'),
+      ])),
+      FakeReply(FakeMessage("Summary: output/submission.zip written.")),
+  ]
+  result, client = run_solve(session, replies)
+  check("s1 returns the real summary", result.startswith("Summary:"),
+        repr(result))
+  check("s1 final_message is the summary",
+        session.final_message.startswith("Summary:"), repr(session.final_message))
+  check("s1 zip exists on disk",
+        os.path.exists(os.path.join(session.root, "output/submission.zip")))
+  check("s1 took 3 model calls", client.calls == 3, str(client.calls))
 
 
-def scenario_3():
-    instruction = "Size the LV cables. Write your answer to `output/submission.zip`."
-    fake = ("I will size the cables. bash(command='ls')\nRESULT\noutput\n"
-            "bash(command='cat sizing.py')\nRESULT\ncode here\n"
-            "I wrote output/submission.zip with the sized cables.")
-    summary = "Done. Deliverable: output/submission.zip."
-    replies = [
-        text_reply(fake),
-        FakeMsg(content="", tool_calls=[tool_call("c1", "write_file", {"path": "output/submission.zip", "content": "ZIPDATA"})]),
-        text_reply(summary),
-    ]
-    client = FakeClient(replies)
-    serve.client = client
-    session = FakeSession(instruction)
-    result = run_scenario(serve.solve(session))
-    assert result == summary, result
-    assert session.final_message == summary
-    assert "/app/files/output/submission.zip" in session.fs
-    assert any(m.get("role") == "user" and "shows tool calls as text" in m.get("content", "") for m in (client.last_messages or [])), client.last_messages
-    print("scenario 3 (fabricated transcript -> rejected, real tool call follows): PASS")
+def scenario_2_malformed_tool_call_retried():
+  """Error echoed as text is retried, never accepted as the summary."""
+  session = FakeSession("Do the task. Deliverable: `output/submission.zip`.")
+  replies = [
+      FakeReply(FakeMessage(EVAL1_ERROR)),
+      FakeReply(FakeMessage(tool_calls=[
+          tool_call("bash", '{"command": "echo ok"}'),
+      ])),
+      FakeReply(FakeMessage(tool_calls=[
+          tool_call("write_file",
+                    '{"path": "output/submission.zip", "content": "PK fake zip"}'),
+      ])),
+      FakeReply(FakeMessage("Summary: done after retry.")),
+  ]
+  result, client = run_solve(session, replies)
+  check("s2 returns the summary, not the error",
+        result.startswith("Summary:"), repr(result))
+  check("s2 final_message is not the error text",
+        "Empty parameters" not in session.final_message,
+        repr(session.final_message))
+  check("s2 took 4 model calls", client.calls == 4, str(client.calls))
 
 
-def scenario_4():
-    instruction = "Validate the fire test. Save the files that make up your answer under `output/`."
-    hallucinated = ("I have completed the analysis and generated the required deliverables "
-                    "under `/app/workspace/output`. Deliverables: validation_memo.docx, "
-                    "error_calculation.txt, rework_recommendations.md. Governing criterion "
-                    "achieved in test: 48 min; in simulation: 46 min. Error: -4%.")
-    replies = [text_reply(hallucinated)]
-    client = FakeClient(replies)
-    serve.client = client
-    session = FakeSession(instruction)
-    result = run_scenario(serve.solve(session))
-    assert result.startswith("The run ended without a deliverable on disk."), result
-    assert session.final_message == result
-    assert "validation_memo" not in result, result
-    assert not session.fs, session.fs
-    print("scenario 4 (hallucinated completion -> honest end, no deliverable): PASS")
+def scenario_3_fabricated_transcript_rejected():
+  """Fake tool-call transcript in text is rejected with a sharp nudge."""
+  session = FakeSession("Do the task. Deliverable: `output/submission.zip`.")
+  replies = [
+      FakeReply(FakeMessage(FABRICATED)),
+      FakeReply(FakeMessage(tool_calls=[
+          tool_call("write_file",
+                    '{"path": "output/submission.zip", "content": "PK fake zip"}'),
+      ])),
+      FakeReply(FakeMessage("Summary: real work done.")),
+  ]
+  result, client = run_solve(session, replies)
+  check("s3 returns the real summary", result.startswith("Summary:"),
+        repr(result))
+  check("s3 final_message is not the fabricated text",
+        "bash(" not in session.final_message, repr(session.final_message))
+  check("s3 took 3 model calls", client.calls == 3, str(client.calls))
 
 
-SMOKE_INSTRUCTION = ("Create a file named `hello.txt` in the current working directory "
-                    "(`/app`) whose entire content is the single line: HELLO. Do not create "
-                    "any other files. When the file exists, reply with the word done and stop.")
+def scenario_4_hallucinated_completion_honest_end():
+  """Eval-2 shape: nudged, then an honest no-deliverable return, FS empty."""
+  session = FakeSession(
+      "Validate the fire test. Save the files that make up your answer under"
+      " `output/`."
+  )
+  replies = [FakeReply(FakeMessage(HALLUCINATED)) for _ in range(12)]
+  result, client = run_solve(session, replies)
+  check("s4 honest no-deliverable message",
+        result.startswith("The run ended without a deliverable on disk."),
+        repr(result))
+  check("s4 does not repeat the hallucinated claim",
+        "48 minutes" not in result and "validation_memo" not in result,
+        repr(result))
+  # Fix A creates output/ (empty) at run start, so "empty" now means the
+  # directory holds no files, not that it does not exist.
+  out_dir = os.path.join(session.root, "output")
+  check("s4 no deliverable files written",
+        not os.path.exists(out_dir) or not os.listdir(out_dir))
+  # Fix B adds exactly one turn: the last-chance write is offered at the
+  # terminal condition, the model replies with text again, then the run
+  # ends honestly.
+  check("s4 bounded calls (3 nudges + 5 gate nudges + 1 forced turn + 1)",
+        client.calls == 10, str(client.calls))
 
 
-def scenario_5():
-    files, dirs = serve.deliverable_candidates(SMOKE_INSTRUCTION)
-    assert "hello.txt" in files, files
-    replies = [
-        FakeMsg(content="", tool_calls=[tool_call("c1", "write_file", {"path": "hello.txt", "content": "HELLO"})]),
-        text_reply("done"),
-    ]
-    client = FakeClient(replies)
-    serve.client = client
-    session = FakeSession(SMOKE_INSTRUCTION, workdir="/app")
-    result = run_scenario(serve.solve(session))
-    assert result == "done", result
-    assert session.final_message == "done"
-    assert session.fs.get("/app/hello.txt") == "HELLO", session.fs
-    print("scenario 5 (smoke regression: hello.txt parsed from instruction): PASS")
+def scenario_5_smoke_regression():
+  """Kit smoke task: hello.txt parsed from the instruction, gate passes."""
+  files, dirs = serve.deliverable_candidates(SMOKE)
+  check("s5 hello.txt parsed from instruction", "hello.txt" in files, str(files))
+  session = FakeSession(SMOKE)
+  replies = [
+      FakeReply(FakeMessage(tool_calls=[
+          tool_call("write_file",
+                    '{"path": "hello.txt", "content": "HELLO\\n"}'),
+      ])),
+      FakeReply(FakeMessage("done")),
+  ]
+  result, client = run_solve(session, replies)
+  check("s5 returns done", result == "done", repr(result))
+  check("s5 took 2 model calls", client.calls == 2, str(client.calls))
+  # The instruction-parse path is what passes this: output/-only would fail.
+  session2 = FakeSession(SMOKE)
+  files2, dirs2 = ["output/submission.zip"], ["output"]
+  baseline = asyncio.run(serve._gate_baseline(session2, files2, dirs2))
+  asyncio.run(session2.write_file("hello.txt", "HELLO\n"))
+  gate, _detail = asyncio.run(
+      serve.deliverable_gate(session2, files2, dirs2, baseline))
+  check("s5 output-only gate would block the smoke task",
+        gate == "missing", gate)
 
 
-def scenario_6():
-    instruction = "Validate the fire test. Save the files that make up your answer under `output/`."
-    replies = [text_reply("I have completed the analysis. Deliverables are in output/.")]
-    client = FakeClient(replies)
-    serve.client = client
-    session = FakeSession(instruction, time_left=100)
-    result = run_scenario(serve.solve(session))
-    assert result.startswith("The run ended without a deliverable on disk."), result
-    assert client.calls == 1, client.calls
-    print("scenario 6 (wrap-up with missing deliverable -> prompt honest return): PASS")
+def scenario_6_wrap_up_honest_return():
+  """Wrap-up with no deliverable: one last-chance write (Fix B), then an
+  honest return when the model still writes nothing."""
+  session = FakeSession(
+      "Do the task. Deliverable: `output/submission.zip`.",
+      time_left_value=100,
+  )
+  replies = [
+      FakeReply(FakeMessage("Summary: almost done.")),
+      FakeReply(FakeMessage("Summary: still no deliverable.")),
+  ]
+  result, client = run_solve(session, replies)
+  check("s6 honest return in wrap-up",
+        result.startswith("The run ended without a deliverable on disk."),
+        repr(result))
+  check("s6 exactly 2 model calls (forced turn + honest return)",
+        client.calls == 2, str(client.calls))
 
 
-def scenario_7():
-    instruction = "Design the roof deck. Write your answer to `output/submission.zip`."
-    summary = "Done. Deliverable: output/submission.zip with the roof deck design."
-    replies = [text_reply(summary)]
-    client = FakeClient(replies)
-    serve.client = client
-    session = FakeSession(instruction, fail_probe=True)
-    result = run_scenario(serve.solve(session))
-    assert summary in result, result
-    assert not result.startswith("The run ended without a deliverable")
-    assert session.final_message == result
-    assert any("deliverable gate unknown" in m for m in session.logs), session.logs
-    print("scenario 7 (unknown gate fails open, logged): PASS")
+def scenario_7_unknown_gate_fails_open():
+  """Probe failure fails open: the model's summary is still returned."""
+  session = FakeSession(SMOKE, fail_probe=True)
+  replies = [
+      FakeReply(FakeMessage(tool_calls=[
+          tool_call("write_file",
+                    '{"path": "hello.txt", "content": "HELLO\\n"}'),
+      ])),
+      FakeReply(FakeMessage("done")),
+  ]
+  result, client = run_solve(session, replies)
+  check("s7 returns the summary on probe failure", result == "done",
+        repr(result))
+  check("s7 probe failure logged",
+        any("baseline probe failed" in line for line in session.logs),
+        str(session.logs))
+
+
+def scenario_8_missing_dir_write_lands():
+  """Fix A (fire-test shape): the agent echoes a file into output/ without
+  mkdir -p. The harness creates output/ at run start, so the write lands
+  and the gate accepts the summary. Without Fix A the redirect fails and
+  the run ends with no deliverable."""
+  session = FakeSession(
+      "Validate the fire test. Save the files that make up your answer under"
+      " `output/`."
+  )
+  summary = "Summary: validation memo written to output/."
+  replies = [
+      FakeReply(FakeMessage(tool_calls=[
+          tool_call("bash",
+                    '{"command": "echo MEMO > output/Validation_Memo.docx"}'),
+      ])),
+      FakeReply(FakeMessage(summary)),
+  ]
+  result, client = run_solve(session, replies)
+  check("s8 returns the summary", result == summary, repr(result))
+  memo = os.path.join(session.root, "output/Validation_Memo.docx")
+  check("s8 memo exists on disk", os.path.exists(memo))
+  with open(memo) as fh:
+    check("s8 memo has the written content", "MEMO" in fh.read())
+  check("s8 took 2 model calls", client.calls == 2, str(client.calls))
+
+
+def scenario_9_forced_minimal_deliverable():
+  """Fix B: at the end of the budget with no deliverable, the model gets one
+  last-chance instruction to write a minimal best-effort deliverable; the
+  final message then says plainly it is best-effort, not complete."""
+  session = FakeSession(
+      "Design the roof deck. Write your answer to `output/submission.zip`."
+  )
+  summary = "Summary: partial roof deck design written."
+  replies = (
+      [FakeReply(FakeMessage("Done. The roof deck design is complete."))
+       for _ in range(9)]
+      + [
+          FakeReply(FakeMessage(tool_calls=[
+              tool_call("write_file",
+                        '{"path": "output/submission.zip", "content": "PK partial"}'),
+          ])),
+          FakeReply(FakeMessage(summary)),
+      ]
+  )
+  result, client = run_solve(session, replies)
+  check("s9 returns the summary with the best-effort note",
+        result.startswith(serve.FORCED_WRITE_NOTE), repr(result))
+  check("s9 summary text is included", summary in result, repr(result))
+  check("s9 final_message carries the note",
+        session.final_message == result, repr(session.final_message))
+  check("s9 partial deliverable exists on disk",
+        os.path.exists(os.path.join(session.root, "output/submission.zip")))
+  check("s9 bounded calls (3 nudges + 5 gate nudges + 1 forced offer"
+        " + 1 write + 1 summary)",
+        client.calls == 11, str(client.calls))
+
+
+def scenario_10_forced_turn_timeout_ends_honestly():
+  """Fix B: if the last-chance turn itself runs out of time, the run ends
+  honestly instead of looping on zero-second timeouts."""
+  session = FakeSession(
+      "Do the task. Deliverable: `output/submission.zip`.",
+      time_left_value=100,
+  )
+  replies = [
+      FakeReply(FakeMessage("Summary: almost done.")),
+      "RAISE_TIMEOUT",
+  ]
+  result, client = run_solve(session, replies)
+  check("s10 honest return after the forced turn times out",
+        result.startswith("The run ended without a deliverable on disk."),
+        repr(result))
+  check("s10 exactly 2 model calls", client.calls == 2, str(client.calls))
+
+
+def unit_gate_baseline():
+  """Pre-existing input files never count; a new deliverable does."""
+  session = FakeSession(
+      "Use `calc_book.xlsx`. Deliverable: `output/submission.zip`."
+  )
+  asyncio.run(session.write_file("calc_book.xlsx", "input"))
+  files, dirs = serve.deliverable_candidates(session.instruction)
+  check("u1 input file parsed as candidate", "calc_book.xlsx" in files,
+        str(files))
+  baseline = asyncio.run(serve._gate_baseline(session, files, dirs))
+  gate, _ = asyncio.run(
+      serve.deliverable_gate(session, files, dirs, baseline))
+  check("u1 input-only state is missing", gate == "missing", gate)
+  asyncio.run(session.write_file("output/submission.zip", "PK fake zip"))
+  gate, detail = asyncio.run(
+      serve.deliverable_gate(session, files, dirs, baseline))
+  check("u1 new deliverable is ok", gate == "ok", f"{gate} {detail}")
+  check("u1 detail names the zip", "submission.zip" in detail, detail)
+
+
+def unit_roof_deck_instruction():
+  """Real roof-deck task.md: the absolute deliverable path is parsed."""
+  with open(
+      "/home/hatch/workspace/kaggle/ple/dataset/tasks/roof-deck-design/"
+      "environment/filesystem/"
+      "final_batch4__structural_task7_roof_deck_design__blind/task.md"
+  ) as fh:
+    instruction = fh.read()
+  files, _dirs = serve.deliverable_candidates(instruction)
+  check("u2 absolute submission.zip parsed",
+        "/filesystem/final_batch4__structural_task7_roof_deck_design__blind"
+        "/output/submission.zip" in files, str(files[:5]))
+
+
+def main():
+  scenario_1_text_only_done_then_real_work()
+  scenario_2_malformed_tool_call_retried()
+  scenario_3_fabricated_transcript_rejected()
+  scenario_4_hallucinated_completion_honest_end()
+  scenario_5_smoke_regression()
+  scenario_6_wrap_up_honest_return()
+  scenario_7_unknown_gate_fails_open()
+  scenario_8_missing_dir_write_lands()
+  scenario_9_forced_minimal_deliverable()
+  scenario_10_forced_turn_timeout_ends_honestly()
+  unit_gate_baseline()
+  unit_roof_deck_instruction()
+  print("ALL SCENARIOS PASS")
 
 
 if __name__ == "__main__":
-    scenario_1()
-    scenario_2()
-    scenario_3()
-    scenario_4()
-    scenario_5()
-    scenario_6()
-    scenario_7()
-    print("ALL STUB SCENARIOS PASSED")
+  main()

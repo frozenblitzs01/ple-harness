@@ -59,6 +59,13 @@ MAX_NUDGES = 3
 MAX_GATE_NUDGES = 5
 # consecutive identical tool-error replies before the run stops honestly (§2)
 MAX_ERR_RETRIES = 3
+# note prepended to the final message when the deliverable only exists
+# because of the last-chance write (Fix B): the file is best-effort and may
+# be partial, so the message must not present it as a complete delivery.
+FORCED_WRITE_NOTE = (
+    "Best-effort deliverable written at the time limit; the summary below"
+    " describes what was actually produced. "
+)
 # lower it for a small context window
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "32000"))
 # Claude caches a prompt prefix only when marked with cache_control. Each call
@@ -400,6 +407,33 @@ def _parse_gate_output(output):
   return files, dirs
 
 
+async def _ensure_deliverable_dirs(session, files, dirs):
+  """Best-effort mkdir -p of the deliverable dirs and file parents (Fix A).
+
+  Runs once at solve() start, before the baseline snapshot, so a model write
+  to a standard path cannot fail for a missing directory: the fire-test eval
+  wrote /app/output/Validation_Memo.docx via echo without mkdir -p, so the
+  file never existed and the gate correctly found nothing. The baseline is
+  taken after, so the empty directories never count as delivered. A failure
+  is logged, never fatal: the model can still create the directories itself.
+  """
+  targets = set(dirs)
+  for path in files:
+    parent = os.path.dirname(path)
+    if parent:
+      targets.add(parent)
+  if not targets:
+    return
+  cmd = "mkdir -p " + " ".join(shlex.quote(p) for p in sorted(targets))
+  try:
+    await session.exec(cmd, timeout_sec=30)
+  except taskbridge.TaskError as exc:
+    await session.log(
+        "deliverable directories could not be created"
+        f" ({str(exc)[:200]}); continuing"
+    )
+
+
 async def _gate_baseline(session, files, dirs):
   """One probe at the start of solve(); None when it fails (gate fails open)."""
   try:
@@ -497,6 +531,47 @@ def _gate_nudge_text(detail, nudge_number, remaining):
   )
 
 
+def _forced_write_text(detail, files):
+  """Last-chance instruction (Fix B) when the budget is nearly gone and no
+  deliverable exists: write a minimal best-effort version now."""
+  target = files[0] if files else "output/submission.zip"
+  return (
+      "Time is almost up and there is still no deliverable on disk"
+      f" ({detail}). This is your last chance: use the tools now to write"
+      f" a minimal best-effort version of the deliverable to `{target}`"
+      " (or under `output/` for a multi-file answer) from the work you"
+      " have done so far — even if it is partial or incomplete, a file on"
+      " disk can still score, while no file scores 0 for certain. Then"
+      " reply with a summary that says plainly what you actually wrote"
+      " and what is still missing or incomplete — do not claim it is"
+      " complete."
+  )
+
+
+async def _end_at_time_limit(session, files, dirs, baseline):
+  """Honest return when the last-chance turn itself runs out of time (Fix B).
+
+  The budget is gone, so the run ends here instead of looping on
+  zero-second model-call timeouts.
+  """
+  gate, detail = await deliverable_gate(session, files, dirs, baseline)
+  if gate == "ok":
+    session.final_message = (
+        "The run ended at the time limit with a deliverable on disk. "
+        + detail
+    )
+  elif gate == "unknown":
+    session.final_message = (
+        "The run ended at the time limit; the deliverable check could"
+        " not run, so nothing was verified."
+    )
+  else:
+    session.final_message = (
+        "The run ended without a deliverable on disk. " + detail
+    )
+  return session.final_message
+
+
 async def solve(session):
   """Runs the minimal tool-calling loop on `session` until completion.
 
@@ -513,34 +588,61 @@ async def solve(session):
   # The deliverable gate (§1): snapshot the container before the model does
   # any work, so pre-existing input files never count as deliverables.
   files, dirs = deliverable_candidates(session.instruction)
+  # Fix A: create the deliverable directories first, so the baseline sees
+  # the (empty) directories and a later write still counts as delivered.
+  await _ensure_deliverable_dirs(session, files, dirs)
   baseline = await _gate_baseline(session, files, dirs)
   # head: the start of an answer cut off at the output limit
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
   gate_nudges, err_streak, last_err = 0, 0, ""
+  # Fix B: the last-chance write is offered once per run; the granted turn
+  # gets one tool call even when time is nearly up.
+  forced_write_offered, forced_write_turn = False, False
   while True:
     left = session.time_left()  # None when the task has no time limit
     wrap_up = left is not None and left < WRAP_UP_SEC
-    if wrap_up and messages[-1:] != [WRAP_UP]:  # asked once, also on a retry
+    # Fix B: the granted turn gets tools even when time is nearly up. Only
+    # the call shaping uses the suppressed value (call_wrap_up); wrap_up
+    # itself still records that time is nearly up, so the accept branch
+    # ends the run afterwards instead of treating it as a normal nudge.
+    force_turn = forced_write_turn
+    call_wrap_up = wrap_up and not force_turn
+    if call_wrap_up and messages[-1:] != [WRAP_UP]:  # asked once, also on a retry
       messages.append(dict(WRAP_UP))
+    # The forced-write turn may use the whole remaining time: the task's
+    # hard time limit is the backstop, and the call is cut there instead of
+    # at the wrap-up point.
+    if left is None or call_wrap_up:
+      call_timeout = None
+    elif force_turn:
+      call_timeout = left
+    else:
+      call_timeout = left - WRAP_UP_SEC
     try:  # a call still running when the wrap-up starts is stopped
       reply = await asyncio.wait_for(
           client.chat.completions.create(
               model=MODEL,
               messages=marked(messages),
               tools=TOOLS,
-              tool_choice="none" if wrap_up else "auto",
+              tool_choice="none" if call_wrap_up else "auto",
               reasoning_effort=EFFORT,
               max_completion_tokens=MAX_OUTPUT_TOKENS,
           ),
-          None if left is None or wrap_up else left - WRAP_UP_SEC,
+          call_timeout,
       )
     except asyncio.TimeoutError:
+      if force_turn:
+        # Fix B: the last-chance turn ran out of time, so the budget is
+        # gone. End honestly instead of looping on zero-second timeouts.
+        forced_write_turn = False
+        return await _end_at_time_limit(session, files, dirs, baseline)
       continue
     except openai.APIError as exc:
       if await recover(session, messages, exc, waits, WRAP_UP_SEC):
         continue
       raise
     waits = iter(RETRY_WAITS)
+    forced_write_turn = False  # the granted turn has now happened
     if reply.usage:
       details = getattr(reply.usage, "prompt_tokens_details", None)
       await session.usage(
@@ -621,13 +723,29 @@ async def solve(session):
             })
             nudges, head = nudges + 1, text
             continue
-      if wrap_up or ((message.content and not cut) and (used_tool or nudges == MAX_NUDGES)):
+      if wrap_up or ((message.content and not cut) and (used_tool or nudges == MAX_NUDGES or forced_write_offered)):
         # §1: never accept a plain-text reply as done until the deliverable
         # is on disk. §4: only an accepted reply becomes the final message,
         # so a hallucinated summary can never be what taskbridge sends.
+        # Fix B: once the last-chance write has been offered, a text reply
+        # is gate-checked at once instead of burning generic nudges — the
+        # run is already at the end of its budget.
         gate, detail = await deliverable_gate(session, files, dirs, baseline)
         if gate == "missing":
           if wrap_up or gate_nudges >= MAX_GATE_NUDGES:
+            if not forced_write_offered:
+              # Fix B: one last chance to write a minimal best-effort
+              # deliverable instead of ending empty (no file is a certain
+              # 0; a partial file can score above 0).
+              forced_write_offered = True
+              forced_write_turn = True
+              if message.content:
+                messages.append(turn)
+              messages.append({
+                  "role": "user",
+                  "content": _forced_write_text(detail, files),
+              })
+              continue
             session.final_message = (
                 "The run ended without a deliverable on disk. " + detail
             )
@@ -654,7 +772,13 @@ async def solve(session):
               f" ({text.strip()[:200]})."
           )
           return session.final_message
-        session.final_message = text
+        if gate == "ok" and forced_write_offered:
+          # Fix B: the deliverable only exists because of the last-chance
+          # write. Say plainly that it is best-effort instead of letting
+          # the model's summary present it as a complete delivery.
+          session.final_message = FORCED_WRITE_NOTE + text
+        else:
+          session.final_message = text
         return session.final_message
       nudges, head = nudges + 1, text
       if message.content:  # cut off at the output limit
