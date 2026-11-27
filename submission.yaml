@@ -3,7 +3,7 @@
 # against a local OpenAI-compatible model server.
 # For the real submission this MUST go back to a google-cloud/<id> model.
 name: frozen008-harness
-model_api: gemini/gemini-3.5-flash-lite
+model_api: google-cloud/gemini-3.8-flash
 install: >-
   uv venv --python 3.12 /opt/harness/venv
   && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt

@@ -1,11 +1,11 @@
 {
   "format": 1,
   "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
-  "created": "2026-11-24T05:38:44Z",
+  "created": "2026-11-27T02:43:16Z",
   "harness": {
     "name": "frozen008-harness",
-    "model_api": "openai-compatible/qwen-flash-character",
-    "tree": "d771cafb74cc94b0643862795c9d0419b7b926d003ce6910bedced2c8e74d3c0",
+    "model_api": "gemini/gemini-3.5-flash-lite",
+    "tree": "31608fd88696971b23fa9adb511fd7d3f5bedbdbfa8e57fbfaa49008d5ac4d38",
     "files": {
       ".devcontainer/devcontainer.json": "100644 48a8f48666d045572ab26d34c28607f3f2d6e48d",
       ".gitignore": "100644 9e8d0d9f4d0f8ba9a709484f4af7ff07484f4860",
@@ -112,13 +112,13 @@
       "kit/sample_submissions/plan-verify/taskbridge.py": "100644 26cc3d6cf8dbcaed859731ce9a6881f4ca8bfe40",
       "kit/sample_submissions/taskbridge.py": "100644 26cc3d6cf8dbcaed859731ce9a6881f4ca8bfe40",
       "requirements.txt": "100644 13ba6dbe5a230d71da63dd42ee49e86f580056dc",
-      "serve-loop-fix-test.py": "100644 f32df3d1d990c28b649728caf511926fcb390509",
-      "serve.py": "100644 88abed535916748f561a0173ae5651007ac0208d",
-      "submission.yaml": "100644 3b4b6b9cbfd174e6da104f442abc379b7b29cd2f",
+      "serve-loop-fix-test.py": "100644 c88dd4d8d9d329fa77227c97b9c645398bdf4b3b",
+      "serve.py": "100644 3c778f21c5802483250578b129279db0d1524094",
+      "submission.yaml": "100644 98b58af2e6e78274a5f49831731ba1de93a358a2",
       "taskbridge.py": "100644 26cc3d6cf8dbcaed859731ce9a6881f4ca8bfe40"
     },
-    "commit": "b4015d23eb0ec5758515f9dd8e42927d4167a7be",
-    "dirty": true
+    "commit": "fc65c15ffcda2260158a41878896f38e9f82923c",
+    "dirty": false
   },
   "tasks": {
     "lv-cable-sizing": {
@@ -134,14 +134,16 @@
       "skipped": []
     },
     "roof-deck-design": {
-      "run": "frozen008-harness-20261124-053338",
-      "trial": "roof-deck-design__iByx6Qw",
+      "run": "frozen008-harness-20261127-023324",
+      "trial": "roof-deck-design__DfoStcH",
       "ended": "ok",
-      "reward": 0.0,
-      "tree": "d771cafb74cc94b0643862795c9d0419b7b926d003ce6910bedced2c8e74d3c0",
+      "reward": 0.119048,
+      "tree": "31608fd88696971b23fa9adb511fd7d3f5bedbdbfa8e57fbfaa49008d5ac4d38",
       "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
-      "files": {},
-      "final_message": "4e52810a88b562ca31866923fc243d2801031777",
+      "files": {
+        "filesystem/final_batch4__structural_task7_roof_deck_design__blind/output/submission.zip": "922ae4c8acab08eeb626daa4d2c7b3ea29327f70"
+      },
+      "final_message": "151f7629d6bd0ea298990adcfcb7a2fe6ded3868",
       "deleted": [],
       "skipped": []
     }
